@@ -1,0 +1,26 @@
+[package]
+name = "bqrb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "High-performance multi-producer single-consumer chunk ring buffer with C ABI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
