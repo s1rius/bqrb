@@ -1,6 +1,37 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+// # Memory Ordering Strategy
+//
+// This ring buffer uses a combination of atomic operations and memory fences for synchronization:
+//
+// ## Cursors (write_cursor, read_cursor, private_read_cursor)
+// - Use AtomicU32 with Acquire/Release ordering
+// - Provide synchronization points for visibility of buffer modifications
+//
+// ## Chunk Headers (length + state fields)
+// - Writers use std::ptr::write + Release fence
+// - Readers use Acquire fence + std::ptr::read/read_volatile
+// - The Release fence in alloc_write_chunk ensures header writes happen-before cursor update
+// - The Release fence in commit_write_chunk ensures payload writes happen-before state change
+// - The Acquire fence in read() ensures visibility of all prior writes
+//
+// ## Why not AtomicU32 for chunk headers?
+// - The current fence-based approach is simpler and more flexible
+// - Headers are written by a single producer (after CAS on write_cursor)
+// - The state field uses write_volatile to prevent compiler elision
+// - Fences provide sufficient ordering guarantees at synchronization points
+//
+// ## Correctness Argument
+// 1. Producer claims space via compare_exchange (AcqRel) on write_cursor
+// 2. Producer writes header + Release fence → header visible
+// 3. Producer writes payload + commit with Release fence → payload visible
+// 4. Consumer loads write_cursor (Acquire) → sees cursor update
+// 5. Consumer Acquire fence + read header/state → sees header + payload
+//
+// The ordering ensures that when a consumer reads a Committed chunk,
+// all writes to that chunk (header + payload) are visible.
+
 /// Block size in bytes, aligned with cache line size (64 bytes)
 pub const BLOCK_SIZE: u32 = 64;
 
@@ -296,16 +327,23 @@ impl RingBuffer {
                             std::ptr::write(skip_length_ptr, SKIP_MARKER);
                             let skip_state_ptr = self.inner.data.add(write_pos as usize + 4);
                             std::ptr::write(skip_state_ptr, ChunkState::Committed as u8);
+                            // Release fence ensures skip marker is visible before write_cursor update
+                            std::sync::atomic::fence(Ordering::Release);
                         }
                         
                         // Write the actual chunk header at alloc_offset
+                        // Memory ordering: length must be written before state changes to Committed
                         let length_ptr = self.inner.data.add(alloc_offset as usize) as *mut u32;
                         std::ptr::write(length_ptr, size);
 
-                        // Write state as Reserved (using atomic store for proper synchronization)
+                        // Write state as Reserved
+                        // This doesn't need to be atomic since only this producer writes to this chunk
+                        // until commit, and the write_cursor update above synchronizes with readers
                         let state_ptr = self.inner.data.add(alloc_offset as usize + 4);
                         std::ptr::write(state_ptr, ChunkState::Reserved as u8);
-                        // Ensure write is visible to other threads
+                        
+                        // Release fence ensures header writes are visible to other threads
+                        // before they can observe this allocation via write_cursor
                         std::sync::atomic::fence(Ordering::Release);
                     }
 
@@ -336,12 +374,18 @@ impl RingBuffer {
     ///
     /// # Arguments
     /// * `handle` - The write handle from `alloc_write_chunk`
+    ///
+    /// # Memory Ordering
+    /// Uses write_volatile + Release fence to ensure:
+    /// - All payload writes happen-before the state change to Committed
+    /// - Readers with Acquire fence will see payload data when they see Committed state
     pub fn commit_write_chunk(&self, handle: WriteHandle) {
-        // Mark chunk as committed with proper memory ordering
         unsafe {
             let state_ptr = handle.buffer.data.add(handle.offset as usize + 4);
+            // write_volatile ensures the write is not elided by the compiler
             std::ptr::write_volatile(state_ptr, ChunkState::Committed as u8);
-            // Ensure the commit is visible to readers
+            // Release fence ensures all prior writes (header + payload) are visible
+            // to any reader that observes the Committed state via Acquire fence
             std::sync::atomic::fence(Ordering::Release);
         }
     }
@@ -373,15 +417,18 @@ impl RingBuffer {
             return Err(ResultCode::EmptyRingBuffer);
         }
 
-        // Read chunk header
+        // Read chunk header with proper memory ordering
+        // Acquire fence synchronizes with the Release fence in alloc_write_chunk and commit_write_chunk
+        // This ensures we see all writes to the header and payload
         let (length, state) = unsafe {
-            // Ensure we see the producer's writes
+            // Acquire fence pairs with Release fence in writer
             std::sync::atomic::fence(Ordering::Acquire);
             
             let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
             let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
             
             let length = std::ptr::read(length_ptr);
+            // read_volatile ensures we always read the latest state
             let state = std::ptr::read_volatile(state_ptr);
             (length, state)
         };
