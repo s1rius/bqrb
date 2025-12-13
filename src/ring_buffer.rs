@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Block size in bytes, aligned with cache line size (64 bytes)
@@ -140,10 +140,12 @@ impl Drop for RingBufferInner {
         if !self.data.is_null() {
             unsafe {
                 // Deallocate the aligned buffer
-                let layout = std::alloc::Layout::from_size_align_unchecked(
+                // Safety: This layout is guaranteed to be valid by the constructor
+                let layout = std::alloc::Layout::from_size_align(
                     self.capacity as usize,
                     BLOCK_SIZE as usize,
-                );
+                )
+                .expect("Layout should be valid since it was created in constructor");
                 std::alloc::dealloc(self.data, layout);
             }
         }
@@ -178,10 +180,11 @@ impl RingBuffer {
         
         // Allocate aligned buffer
         let data = unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(
+            let layout = std::alloc::Layout::from_size_align(
                 capacity as usize,
                 BLOCK_SIZE as usize,
-            );
+            )
+            .map_err(|_| ResultCode::BufferNotInited)?;
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 return Err(ResultCode::BufferNotInited);
@@ -279,9 +282,11 @@ impl RingBuffer {
                         let length_ptr = self.inner.data.add(alloc_offset as usize) as *mut u32;
                         std::ptr::write(length_ptr, size);
 
-                        // Write state as Reserved
-                        let state_ptr = self.inner.data.add(alloc_offset as usize + 4) as *mut AtomicU8;
-                        (*state_ptr).store(ChunkState::Reserved as u8, Ordering::Release);
+                        // Write state as Reserved (using atomic store for proper synchronization)
+                        let state_ptr = self.inner.data.add(alloc_offset as usize + 4);
+                        std::ptr::write(state_ptr, ChunkState::Reserved as u8);
+                        // Ensure write is visible to other threads
+                        std::sync::atomic::fence(Ordering::Release);
                     }
 
                     // Calculate approximate used blocks
@@ -312,10 +317,12 @@ impl RingBuffer {
     /// # Arguments
     /// * `handle` - The write handle from `alloc_write_chunk`
     pub fn commit_write_chunk(&self, handle: WriteHandle) {
-        // Mark chunk as committed
+        // Mark chunk as committed with proper memory ordering
         unsafe {
-            let state_ptr = handle.buffer.data.add(handle.offset as usize + 4) as *mut AtomicU8;
-            (*state_ptr).store(ChunkState::Committed as u8, Ordering::Release);
+            let state_ptr = handle.buffer.data.add(handle.offset as usize + 4);
+            std::ptr::write_volatile(state_ptr, ChunkState::Committed as u8);
+            // Ensure the commit is visible to readers
+            std::sync::atomic::fence(Ordering::Release);
         }
     }
 
@@ -348,11 +355,14 @@ impl RingBuffer {
 
         // Read chunk header
         let (length, state) = unsafe {
+            // Ensure we see the producer's writes
+            std::sync::atomic::fence(Ordering::Acquire);
+            
             let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
-            let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const AtomicU8;
+            let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
             
             let length = std::ptr::read(length_ptr);
-            let state = (*state_ptr).load(Ordering::Acquire);
+            let state = std::ptr::read_volatile(state_ptr);
             (length, state)
         };
 
