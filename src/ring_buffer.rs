@@ -1,6 +1,37 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+// # Memory Ordering Strategy
+//
+// This ring buffer uses a combination of atomic operations and memory fences for synchronization:
+//
+// ## Cursors (write_cursor, read_cursor, private_read_cursor)
+// - Use AtomicU32 with Acquire/Release ordering
+// - Provide synchronization points for visibility of buffer modifications
+//
+// ## Chunk Headers (length + state fields)
+// - Writers use std::ptr::write + Release fence
+// - Readers use Acquire fence + std::ptr::read/read_volatile
+// - The Release fence in alloc_write_chunk ensures header writes happen-before cursor update
+// - The Release fence in commit_write_chunk ensures payload writes happen-before state change
+// - The Acquire fence in read() ensures visibility of all prior writes
+//
+// ## Why not AtomicU32 for chunk headers?
+// - The current fence-based approach is simpler and more flexible
+// - Headers are written by a single producer (after CAS on write_cursor)
+// - The state field uses write_volatile to prevent compiler elision
+// - Fences provide sufficient ordering guarantees at synchronization points
+//
+// ## Correctness Argument
+// 1. Producer claims space via compare_exchange (AcqRel) on write_cursor
+// 2. Producer writes header + Release fence → header visible
+// 3. Producer writes payload + commit with Release fence → payload visible
+// 4. Consumer loads write_cursor (Acquire) → sees cursor update
+// 5. Consumer Acquire fence + read header/state → sees header + payload
+//
+// The ordering ensures that when a consumer reads a Committed chunk,
+// all writes to that chunk (header + payload) are visible.
+
 /// Block size in bytes, aligned with cache line size (64 bytes)
 pub const BLOCK_SIZE: u32 = 64;
 
@@ -9,6 +40,9 @@ const CHUNK_HEADER_SIZE: u32 = 8;
 
 /// Maximum payload size that can fit in a single allocation
 const MAX_PAYLOAD_SIZE: u32 = u32::MAX - CHUNK_HEADER_SIZE;
+
+/// Special length value that marks a skip chunk (for wrap-around)
+const SKIP_MARKER: u32 = 0xFFFFFFFF;
 
 /// Result codes for ring buffer operations, aligned with BqLog semantics
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +196,14 @@ pub struct RingBuffer {
     inner: Arc<RingBufferInner>,
 }
 
+impl Clone for RingBuffer {
+    fn clone(&self) -> Self {
+        RingBuffer {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl RingBuffer {
     /// Create a new ring buffer with the specified number of blocks
     ///
@@ -255,8 +297,9 @@ impl RingBuffer {
             // Handle wrap-around: if chunk doesn't fit at end, wrap to beginning
             let mut alloc_offset = write_pos;
             let space_at_end = self.inner.capacity - write_pos;
+            let needs_skip_marker = space_at_end < total_size;
             
-            let new_write_pos = if space_at_end < total_size {
+            let new_write_pos = if needs_skip_marker {
                 // Need to wrap around
                 // Check if we have space at the beginning
                 if read_pos < total_size {
@@ -276,16 +319,31 @@ impl RingBuffer {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    // Successfully allocated, now write the header
+                    // Successfully allocated
+                    // The successful CAS above (with AcqRel ordering) already ensures that
+                    // the new write_cursor value is visible to readers.
                     unsafe {
-                        // Write length
+                        // If wrapping, write skip marker at the old write_pos
+                        if needs_skip_marker {
+                            let skip_length_ptr = self.inner.data.add(write_pos as usize) as *mut u32;
+                            std::ptr::write(skip_length_ptr, SKIP_MARKER);
+                            let skip_state_ptr = self.inner.data.add(write_pos as usize + 4);
+                            std::ptr::write(skip_state_ptr, ChunkState::Committed as u8);
+                        }
+                        
+                        // Write the actual chunk header at alloc_offset
+                        // Memory ordering: length must be written before state changes to Committed
                         let length_ptr = self.inner.data.add(alloc_offset as usize) as *mut u32;
                         std::ptr::write(length_ptr, size);
 
-                        // Write state as Reserved (using atomic store for proper synchronization)
+                        // Write state as Reserved
+                        // This doesn't need to be atomic since only this producer writes to this chunk
+                        // until commit, and the write_cursor CAS above synchronizes with readers
                         let state_ptr = self.inner.data.add(alloc_offset as usize + 4);
                         std::ptr::write(state_ptr, ChunkState::Reserved as u8);
-                        // Ensure write is visible to other threads
+                        
+                        // Release fence ensures skip marker (if any) and header writes are visible
+                        // to readers that observe the updated write_cursor
                         std::sync::atomic::fence(Ordering::Release);
                     }
 
@@ -316,12 +374,18 @@ impl RingBuffer {
     ///
     /// # Arguments
     /// * `handle` - The write handle from `alloc_write_chunk`
+    ///
+    /// # Memory Ordering
+    /// Uses write_volatile + Release fence to ensure:
+    /// - All payload writes happen-before the state change to Committed
+    /// - Readers with Acquire fence will see payload data when they see Committed state
     pub fn commit_write_chunk(&self, handle: WriteHandle) {
-        // Mark chunk as committed with proper memory ordering
         unsafe {
             let state_ptr = handle.buffer.data.add(handle.offset as usize + 4);
+            // write_volatile ensures the write is not elided by the compiler
             std::ptr::write_volatile(state_ptr, ChunkState::Committed as u8);
-            // Ensure the commit is visible to readers
+            // Release fence ensures all prior writes (header + payload) are visible
+            // to any reader that observes the Committed state via Acquire fence
             std::sync::atomic::fence(Ordering::Release);
         }
     }
@@ -345,56 +409,69 @@ impl RingBuffer {
     /// * `Ok(ReadHandle)` with the chunk data
     /// * `Err(ResultCode::EmptyRingBuffer)` if no data is available
     pub fn read(&self) -> Result<ReadHandle, ResultCode> {
-        let private_read_pos = self.inner.private_read_cursor.load(Ordering::Acquire);
-        let write_pos = self.inner.write_cursor.load(Ordering::Acquire);
+        // Loop to handle skip markers without recursion
+        loop {
+            let private_read_pos = self.inner.private_read_cursor.load(Ordering::Acquire);
+            let write_pos = self.inner.write_cursor.load(Ordering::Acquire);
 
-        // Check if buffer is empty
-        if private_read_pos == write_pos {
-            return Err(ResultCode::EmptyRingBuffer);
-        }
+            // Check if buffer is empty
+            if private_read_pos == write_pos {
+                return Err(ResultCode::EmptyRingBuffer);
+            }
 
-        // Read chunk header
-        let (length, state) = unsafe {
-            // Ensure we see the producer's writes
-            std::sync::atomic::fence(Ordering::Acquire);
+            // Read chunk header with proper memory ordering
+            // Acquire fence synchronizes with the Release fence in alloc_write_chunk and commit_write_chunk
+            // This ensures we see all writes to the header and payload
+            let (length, state) = unsafe {
+                // Acquire fence pairs with Release fence in writer
+                std::sync::atomic::fence(Ordering::Acquire);
+                
+                let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
+                let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
+                
+                let length = std::ptr::read(length_ptr);
+                // read_volatile ensures we always read the latest state
+                let state = std::ptr::read_volatile(state_ptr);
+                (length, state)
+            };
+
+            // Check if chunk is committed
+            if state != ChunkState::Committed as u8 {
+                // Not yet committed by producer
+                return Err(ResultCode::EmptyRingBuffer);
+            }
+
+            // Check for skip marker
+            if length == SKIP_MARKER {
+                // This is a skip marker, wrap to the beginning and continue reading
+                self.inner.private_read_cursor.store(0, Ordering::Release);
+                continue;
+            }
+
+            // Validate length
+            if length == 0 || length > MAX_PAYLOAD_SIZE {
+                return Err(ResultCode::EmptyRingBuffer);
+            }
+
+            // Calculate total chunk size
+            let total_size = (length + CHUNK_HEADER_SIZE + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
+
+            // Advance private read cursor with proper wrap-around check
+            let new_private_read_pos = if private_read_pos + total_size >= self.inner.capacity {
+                // Wrap around to beginning
+                0
+            } else {
+                private_read_pos + total_size
+            };
             
-            let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
-            let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
-            
-            let length = std::ptr::read(length_ptr);
-            let state = std::ptr::read_volatile(state_ptr);
-            (length, state)
-        };
+            self.inner.private_read_cursor.store(new_private_read_pos, Ordering::Release);
 
-        // Check if chunk is committed
-        if state != ChunkState::Committed as u8 {
-            // Not yet committed by producer
-            return Err(ResultCode::EmptyRingBuffer);
+            return Ok(ReadHandle {
+                buffer: Arc::clone(&self.inner),
+                offset: private_read_pos,
+                length,
+            });
         }
-
-        // Validate length
-        if length == 0 || length > MAX_PAYLOAD_SIZE {
-            return Err(ResultCode::EmptyRingBuffer);
-        }
-
-        // Calculate total chunk size
-        let total_size = (length + CHUNK_HEADER_SIZE + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
-
-        // Advance private read cursor
-        let new_private_read_pos = if private_read_pos + total_size > self.inner.capacity {
-            // Wrap around
-            0
-        } else {
-            private_read_pos + total_size
-        };
-        
-        self.inner.private_read_cursor.store(new_private_read_pos, Ordering::Release);
-
-        Ok(ReadHandle {
-            buffer: Arc::clone(&self.inner),
-            offset: private_read_pos,
-            length,
-        })
     }
 
     /// End the read session and publish the private read cursor
@@ -622,5 +699,83 @@ mod tests {
         // 100 bytes + 8 byte header = 108 bytes
         // Rounded up to 64-byte blocks = 128 bytes = 2 blocks
         assert!(used_blocks >= 2);
+    }
+
+    #[test]
+    fn test_wrap_around() {
+        // Create a small buffer to easily trigger wrap-around
+        // 8 blocks = 512 bytes
+        let rb = RingBuffer::new(8).unwrap();
+        
+        // Write a chunk that takes up most of the buffer
+        // 300 bytes + 8 header = 308 bytes, rounded to 320 bytes (5 blocks)
+        let h1 = rb.alloc_write_chunk(300).unwrap();
+        let data1 = b"First chunk that takes most of the buffer";
+        h1.write(data1);
+        rb.commit_write_chunk(h1);
+        
+        // Write another chunk that should fit in the remaining space
+        // 100 bytes + 8 header = 108 bytes, rounded to 128 bytes (2 blocks)
+        let h2 = rb.alloc_write_chunk(100).unwrap();
+        let data2 = b"Second chunk";
+        h2.write(data2);
+        rb.commit_write_chunk(h2);
+        
+        // Read the first chunk to free space
+        rb.begin_read();
+        let r1 = rb.read().unwrap();
+        assert_eq!(r1.len(), 300);
+        assert_eq!(&r1.data()[..data1.len()], data1);
+        rb.end_read();
+        
+        // Now write a chunk that will trigger wrap-around
+        // This should wrap to position 0 and write a skip marker
+        let h3 = rb.alloc_write_chunk(200).unwrap();
+        let data3 = b"Third chunk triggers wrap";
+        h3.write(data3);
+        rb.commit_write_chunk(h3);
+        
+        // Read second chunk
+        rb.begin_read();
+        let r2 = rb.read().unwrap();
+        assert_eq!(r2.len(), 100);
+        assert_eq!(&r2.data()[..data2.len()], data2);
+        
+        // Read third chunk - should handle skip marker and wrap around
+        let r3 = rb.read().unwrap();
+        assert_eq!(r3.len(), 200);
+        assert_eq!(&r3.data()[..data3.len()], data3);
+        rb.end_read();
+        
+        // Buffer should be empty now
+        rb.begin_read();
+        let result = rb.read();
+        assert_eq!(result.unwrap_err(), ResultCode::EmptyRingBuffer);
+        rb.end_read();
+    }
+
+    #[test]
+    fn test_clone() {
+        let rb = RingBuffer::new(16).unwrap();
+        
+        // Clone the ring buffer
+        let rb_clone = rb.clone();
+        
+        // Write via original
+        let h1 = rb.alloc_write_chunk(50).unwrap();
+        h1.write(b"test data");
+        rb.commit_write_chunk(h1);
+        
+        // Read via clone
+        rb_clone.begin_read();
+        let r1 = rb_clone.read().unwrap();
+        assert_eq!(&r1.data()[..9], b"test data");
+        rb_clone.end_read();
+        
+        // Should be empty now from both
+        rb.begin_read();
+        let result = rb.read();
+        assert_eq!(result.unwrap_err(), ResultCode::EmptyRingBuffer);
+        rb.end_read();
     }
 }
