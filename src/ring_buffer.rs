@@ -83,7 +83,6 @@ struct ChunkHeader {
 // Compile-time assertions to ensure alignment safety for atomic operations
 const _: () = {
     use std::mem::{align_of, size_of};
-    use std::sync::atomic::AtomicU32;
     
     // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
     // ChunkHeader requires 4-byte alignment (from AtomicU32)
