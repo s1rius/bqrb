@@ -80,6 +80,20 @@ struct ChunkHeader {
     _padding: [u8; 3],  // Maintain 8-byte header size
 }
 
+// Compile-time assertions to ensure alignment safety for atomic operations
+const _: () = {
+    use std::mem::{align_of, size_of};
+    use std::sync::atomic::AtomicU32;
+    
+    // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
+    // ChunkHeader requires 4-byte alignment (from AtomicU32)
+    // BLOCK_SIZE (64) is a multiple of 4, so all chunk offsets are properly aligned
+    assert!((BLOCK_SIZE as usize).is_multiple_of(align_of::<AtomicU32>()));
+    
+    // Verify ChunkHeader size matches CHUNK_HEADER_SIZE
+    assert!(size_of::<ChunkHeader>() == CHUNK_HEADER_SIZE as usize);
+};
+
 /// Handle for writing data to an allocated chunk
 #[derive(Debug)]
 pub struct WriteHandle {
@@ -334,12 +348,16 @@ impl RingBuffer {
                     unsafe {
                         // If wrapping, write skip marker at the old write_pos
                         if needs_skip_marker {
+                            // SAFETY: write_pos is always a multiple of BLOCK_SIZE (64 bytes),
+                            // which is greater than ChunkHeader's alignment requirement (4 bytes)
                             let skip_header = &*(self.inner.data.add(write_pos as usize) as *const ChunkHeader);
                             skip_header.length.store(SKIP_MARKER, Ordering::Relaxed);
                             skip_header.state.store(ChunkState::Committed as u8, Ordering::Release);
                         }
                         
                         // Write the actual chunk header at alloc_offset
+                        // SAFETY: alloc_offset is always a multiple of BLOCK_SIZE (64 bytes),
+                        // which is greater than ChunkHeader's alignment requirement (4 bytes)
                         let header = &*(self.inner.data.add(alloc_offset as usize) as *const ChunkHeader);
                         header.length.store(size, Ordering::Relaxed);
                         header.state.store(ChunkState::Reserved as u8, Ordering::Release);
@@ -379,6 +397,8 @@ impl RingBuffer {
     /// - Readers with Acquire ordering will see payload data when they see Committed state
     pub fn commit_write_chunk(&self, handle: WriteHandle) {
         unsafe {
+            // SAFETY: handle.offset is always a multiple of BLOCK_SIZE (64 bytes),
+            // which is greater than ChunkHeader's alignment requirement (4 bytes)
             let header = &*(handle.buffer.data.add(handle.offset as usize) as *const ChunkHeader);
             header.state.store(ChunkState::Committed as u8, Ordering::Release);
         }
@@ -417,6 +437,8 @@ impl RingBuffer {
             // Acquire ordering on state load synchronizes with Release ordering in writer
             // This ensures we see all writes to the header and payload
             let (length, state) = unsafe {
+                // SAFETY: private_read_pos is always a multiple of BLOCK_SIZE (64 bytes),
+                // which is greater than ChunkHeader's alignment requirement (4 bytes)
                 let header = &*(self.inner.data.add(private_read_pos as usize) as *const ChunkHeader);
                 let state = header.state.load(Ordering::Acquire);
                 let length = header.length.load(Ordering::Relaxed);
