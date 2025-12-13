@@ -1,572 +1,262 @@
-//! Panic-free, high-performance MPSC chunk ring buffer.
+//! Bounded queue ring buffer (bqrb)
 //!
-//! # Design
-//! - **MPSC**: multiple producers, single consumer.
-//! - **Chunked ring**: writers reserve a contiguous chunk and then publish it.
-//! - **Atomic cursors**:
-//!   - `reserve`: claimed by producers via CAS.
-//!   - `publish`: advanced by producers in order to make data visible.
-//!   - `consume`: advanced by the single consumer.
-//! - **Power-of-two capacity**: enables masking for wrap-around.
-//! - **8-byte alignment** for chunk starts.
-//! - **Panic-free API**: no panics for normal operation; errors are reported.
-//!
-//! This module is `std`-only (uses `std::sync::atomic`).
+//! This crate implements a chunked ring buffer intended for single-producer /
+//! single-consumer usage. The core correctness property is that the producer
+//! publishes chunks and the consumer reads them without data races.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
-use core::hint::spin_loop;
 use core::mem::{align_of, size_of};
-use core::ptr;
-use core::slice;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU8, Ordering};
 
-/// Errors returned by ring operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RingError {
-    /// Capacity is zero, not a power of two, or too small for internal bookkeeping.
-    InvalidCapacity,
-    /// Reservation size is zero or too large.
-    InvalidSize,
-    /// Not enough free space for the requested reservation.
-    Full,
-    /// No published data available for the consumer.
-    Empty,
-}
-
-/// Align `n` up to `align`, where `align` must be a power of two.
-#[inline]
-const fn align_up(n: usize, align: usize) -> usize {
-    (n + (align - 1)) & !(align - 1)
-}
-
-#[inline]
-const fn is_power_of_two(x: usize) -> bool {
-    x != 0 && (x & (x - 1)) == 0
-}
-
-/// Internal header stored before each chunk.
+/// Chunk state machine.
 ///
-/// Layout: `[ChunkHdr][payload padded to 8]`.
-///
-/// `len` is the payload length in bytes.
-/// `state` encodes whether the slot is free/reserved/published.
+/// The producer writes payload, then publishes by setting `state = READY` with
+/// `Release`. The consumer waits/reads `state` with `Acquire` and only then may
+/// read payload.
+const STATE_EMPTY: u8 = 0;
+const STATE_READY: u8 = 1;
+const STATE_READING: u8 = 2;
+
 #[repr(C, align(8))]
 struct ChunkHdr {
-    /// Payload length
+    /// State is atomic to avoid producer/consumer data races.
+    state: AtomicU8,
+    /// Number of bytes written in the chunk.
     len: u32,
-    /// State marker
-    state: u32,
+    /// Reserved/padding for 8-byte header alignment.
+    _pad: u32,
 }
 
-// Chunk state machine:
-// 0 = free
-// 1 = reserved (writer owns, not visible)
-// 2 = published (visible to consumer)
-const STATE_FREE: u32 = 0;
-const STATE_RESERVED: u32 = 1;
-const STATE_PUBLISHED: u32 = 2;
+// Safety / layout invariants used throughout:
+// - ChunkHdr is 8-byte aligned.
+// - ChunkHdr size is a multiple of 8.
+const _: () = {
+    assert!(align_of::<ChunkHdr>() == 8);
+    assert!(size_of::<ChunkHdr>() % 8 == 0);
+};
 
-const CHUNK_ALIGN: usize = 8;
-
-/// A chunk reservation for a producer.
-///
-/// The producer gets a mutable slice to fill. Once done, call `publish()`.
-///
-/// Dropping without publish will keep space reserved; this is intentional to
-/// avoid hidden work in `Drop` and to remain panic-free. Callers should publish
-/// or abandon (by publishing length 0 if desired by higher-level protocol).
-pub struct WriteChunk<'a> {
-    ring: &'a ChunkRing,
-    /// Absolute offset (monotonic) to the start of this chunk header.
-    start: u64,
-    /// Total bytes reserved (header + padded payload)
-    total: u32,
-    /// Payload length
-    len: u32,
-    /// Pointer to payload within ring
-    payload_ptr: *mut u8,
+struct Chunk {
+    hdr: UnsafeCell<ChunkHdr>,
+    data: NonNull<u8>,
+    cap: usize,
 }
 
-impl<'a> WriteChunk<'a> {
-    /// Returns a mutable view of the payload.
-    #[inline]
-    pub fn as_mut(&mut self) -> &mut [u8] {
-        // Safety: reservation guarantees unique ownership of this region until published.
-        unsafe { slice::from_raw_parts_mut(self.payload_ptr, self.len as usize) }
-    }
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
 
-    /// Publish this chunk, making it visible to the consumer.
-    #[inline]
-    pub fn publish(self) {
-        self.ring.publish_chunk(self.start, self.total, self.len);
-        // self consumed; no Drop work.
-    }
-}
-
-unsafe impl Send for WriteChunk<'_> {}
-// Not Sync; mutable access.
-
-/// Zero-copy read handle for the consumer.
-///
-/// Holds an immutable view into the ring's backing store. The consumer must
-/// call `consume()` to advance the consume cursor.
-pub struct ReadChunk<'a> {
-    ring: &'a ChunkRing,
-    start: u64,
-    total: u32,
-    len: u32,
-    payload_ptr: *const u8,
-}
-
-impl<'a> ReadChunk<'a> {
-    /// Returns the payload bytes.
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        // Safety: consumer is single-threaded and this chunk is published and not yet consumed.
-        unsafe { slice::from_raw_parts(self.payload_ptr, self.len as usize) }
-    }
-
-    /// Consume this chunk, advancing the consumer cursor.
-    #[inline]
-    pub fn consume(self) {
-        self.ring.consume_chunk(self.start, self.total);
-    }
-
-    /// Copy the payload into `dst` if it fits.
-    ///
-    /// Returns the number of bytes copied.
-    #[inline]
-    pub fn try_read_into(&self, dst: &mut [u8]) -> Option<usize> {
-        let n = self.len as usize;
-        if dst.len() < n {
-            return None;
+impl Chunk {
+    fn new(cap: usize) -> Self {
+        // cap stays power-of-two. Caller ensures.
+        let layout = Layout::from_size_align(cap, 8).expect("layout");
+        // SAFETY: layout is non-zero size and aligned to 8.
+        let data = unsafe {
+            let p = std::alloc::alloc(layout);
+            NonNull::new(p).expect("alloc")
+        };
+        Self {
+            hdr: UnsafeCell::new(ChunkHdr {
+                state: AtomicU8::new(STATE_EMPTY),
+                len: 0,
+                _pad: 0,
+            }),
+            data,
+            cap,
         }
-        // Safety: bytes are immutable.
-        unsafe {
-            ptr::copy_nonoverlapping(self.payload_ptr, dst.as_mut_ptr(), n);
-        }
-        Some(n)
+    }
+
+    #[inline]
+    fn hdr(&self) -> &ChunkHdr {
+        // SAFETY: only interior mutability via atomics and single-producer/
+        // single-consumer discipline for non-atomic fields.
+        unsafe { &*self.hdr.get() }
+    }
+
+    #[inline]
+    fn hdr_mut(&self) -> &mut ChunkHdr {
+        // SAFETY: producer has exclusive access when writing header fields
+        // before publish; consumer has exclusive access when resetting to empty
+        // after reading. Ordering is enforced with atomics on `state`.
+        unsafe { &mut *self.hdr.get() }
     }
 }
 
-unsafe impl Send for ReadChunk<'_> {}
-unsafe impl Sync for ReadChunk<'_> {}
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        let layout = Layout::from_size_align(self.cap, 8).expect("layout");
+        unsafe { std::alloc::dealloc(self.data.as_ptr(), layout) };
+    }
+}
 
-/// A high-performance MPSC chunk ring.
+/// Ring buffer.
 ///
-/// Backing storage is a byte buffer of size `capacity` where `capacity` is a power of two.
-///
-/// The ring stores variable-sized chunks. Each chunk is prefixed with a `ChunkHdr`.
+/// This type is intended for SPSC usage.
 pub struct ChunkRing {
-    mask: u64,
-    cap: u64,
-    buf: UnsafeCell<Vec<u8>>,
-
-    // Monotonic cursors in bytes (not masked). Keep as u64 for long-running systems.
-    reserve: AtomicU64,
-    publish: AtomicU64,
-    consume: AtomicU64,
-
-    // Optional hint to reduce contention in producers when full; consumer updates.
-    consume_cached: AtomicU64,
-
-    // Single-consumer guard: best-effort (debug aid). Not relied upon for correctness.
-    consumer_entered: AtomicUsize,
+    chunks: Vec<Chunk>,
+    mask: usize,
+    prod: usize,
+    cons: usize,
 }
-
-unsafe impl Send for ChunkRing {}
-unsafe impl Sync for ChunkRing {}
 
 impl ChunkRing {
-    /// Create a new ring with a power-of-two capacity.
-    pub fn new(capacity: usize) -> Result<Self, RingError> {
-        if !is_power_of_two(capacity) {
-            return Err(RingError::InvalidCapacity);
-        }
-        if capacity < 64 {
-            return Err(RingError::InvalidCapacity);
-        }
-        // Ensure buffer alignment requirements are satisfiable.
-        let _ = align_of::<ChunkHdr>();
-
-        let mut buf = Vec::with_capacity(capacity);
-        buf.resize(capacity, 0);
-
-        Ok(Self {
-            mask: (capacity as u64) - 1,
-            cap: capacity as u64,
-            buf: UnsafeCell::new(buf),
-            reserve: AtomicU64::new(0),
-            publish: AtomicU64::new(0),
-            consume: AtomicU64::new(0),
-            consume_cached: AtomicU64::new(0),
-            consumer_entered: AtomicUsize::new(0),
-        })
-    }
-
-    /// Total capacity in bytes.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.cap as usize
-    }
-
-    #[inline]
-    fn buf_ptr(&self) -> *mut u8 {
-        // Safety: Vec is never reallocated after creation.
-        unsafe { (&mut *self.buf.get()).as_mut_ptr() }
-    }
-
-    #[inline]
-    fn hdr_size() -> usize {
-        size_of::<ChunkHdr>()
-    }
-
-    /// Reserve a chunk of `len` bytes.
+    /// Create a ring with `capacity` chunks, each holding up to `chunk_bytes`.
     ///
-    /// Returns a `WriteChunk` providing zero-copy mutable access to the payload.
-    pub fn try_reserve(&self, len: usize) -> Result<WriteChunk<'_>, RingError> {
-        if len == 0 {
-            return Err(RingError::InvalidSize);
-        }
-        if len > (u32::MAX as usize) {
-            return Err(RingError::InvalidSize);
-        }
-
-        let total = Self::hdr_size().saturating_add(len);
-        let total = align_up(total, CHUNK_ALIGN);
-        if total == 0 || total > (u32::MAX as usize) {
-            return Err(RingError::InvalidSize);
-        }
-        if total as u64 > self.cap {
-            return Err(RingError::InvalidSize);
-        }
-
-        // Fast path loop: claim space by advancing reserve cursor.
-        // We must ensure we never overlap the consumer cursor.
-        let mut spin = 0u32;
-        loop {
-            let r = self.reserve.load(Ordering::Relaxed);
-            // Align start of chunk to 8 bytes.
-            let start = align_up(r as usize, CHUNK_ALIGN) as u64;
-            let end = start.wrapping_add(total as u64);
-
-            // Compute used/free using monotonic counters.
-            // Conservative consume view: use cached consume, refresh occasionally.
-            let mut c = self.consume_cached.load(Ordering::Relaxed);
-            // Refresh if we appear full or every so often.
-            if end.wrapping_sub(c) > self.cap || (spin & 0x3f) == 0 {
-                c = self.consume.load(Ordering::Acquire);
-                self.consume_cached.store(c, Ordering::Relaxed);
-            }
-
-            if end.wrapping_sub(c) > self.cap {
-                return Err(RingError::Full);
-            }
-
-            // Attempt to claim [r, end) by setting reserve to end.
-            match self.reserve.compare_exchange_weak(
-                r,
-                end,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // We own region [start, end). Need to write header as RESERVED.
-                    let idx = (start & self.mask) as usize;
-                    // If header or payload would wrap, insert a padding chunk.
-                    // We ensure each chunk is contiguous in the underlying buffer.
-                    if idx + total > self.cap as usize {
-                        // Need to pad to end-of-buffer and retry from next wrap.
-                        // Create a special 0-len published padding chunk so consumer can skip.
-                        let pad = (self.cap as usize) - idx;
-                        if pad >= Self::hdr_size() {
-                            self.write_hdr(start, 0, STATE_PUBLISHED);
-                        }
-                        // Publish padding by advancing publish cursor to end-of-buffer boundary.
-                        self.publish_padding(start, pad as u32);
-                        // Now retry reservation from the wrapped position.
-                        continue;
-                    }
-
-                    // Write RESERVED header.
-                    self.write_hdr(start, len as u32, STATE_RESERVED);
-
-                    let payload_ptr = unsafe { self.buf_ptr().add(idx + Self::hdr_size()) };
-                    return Ok(WriteChunk {
-                        ring: self,
-                        start,
-                        total: total as u32,
-                        len: len as u32,
-                        payload_ptr,
-                    });
-                }
-                Err(_) => {
-                    spin = spin.wrapping_add(1);
-                    if spin < 10 {
-                        spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
-                }
-            }
+    /// `capacity` must be a power of two.
+    pub fn new(capacity: usize, chunk_bytes: usize) -> Self {
+        assert!(capacity.is_power_of_two() && capacity > 0);
+        assert!(chunk_bytes > 0);
+        let chunks = (0..capacity).map(|_| Chunk::new(chunk_bytes)).collect();
+        Self {
+            chunks,
+            mask: capacity - 1,
+            prod: 0,
+            cons: 0,
         }
     }
 
     #[inline]
-    fn write_hdr(&self, start: u64, len: u32, state: u32) {
-        let idx = (start & self.mask) as usize;
-        // Safety: within buffer and properly aligned by CHUNK_ALIGN; ChunkHdr is align(8).
-        unsafe {
-            let p = self.buf_ptr().add(idx) as *mut ChunkHdr;
-            // Use volatile-ish semantics via plain write then fence; header is then published by
-            // updating `publish` cursor with Release ordering.
-            (*p).len = len;
-            (*p).state = state;
-        }
+    fn chunk(&self, idx: usize) -> &Chunk {
+        &self.chunks[idx & self.mask]
     }
 
-    /// Publish a normal reserved chunk.
-    fn publish_chunk(&self, start: u64, total: u32, len: u32) {
-        // Mark header published, then advance publish cursor in order.
-        self.write_hdr(start, len, STATE_PUBLISHED);
-
-        // Advance publish cursor in-order.
-        // Multiple producers may publish out of order; they must wait for turn.
-        let end = start.wrapping_add(total as u64);
-        let mut spin = 0u32;
-        loop {
-            let p = self.publish.load(Ordering::Acquire);
-            if p == start {
-                if self
-                    .publish
-                    .compare_exchange_weak(p, end, Ordering::Release, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                // Wait until earlier chunks are published.
-                spin = spin.wrapping_add(1);
-                if spin < 50 {
-                    spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
+    /// Producer: attempt to reserve the next chunk for writing.
+    /// Returns a mutable slice to write into, and a commit handle.
+    pub fn producer_reserve(&mut self) -> Option<ProducerChunk<'_>> {
+        let c = self.chunk(self.prod);
+        if c.hdr().state.load(Ordering::Acquire) != STATE_EMPTY {
+            return None;
         }
+        // Mark as being written by producer (non-atomic len will be set before publish).
+        c.hdr().state.store(STATE_READING, Ordering::Relaxed);
+        Some(ProducerChunk { ring: self, idx: self.prod })
     }
 
-    /// Publish padding when the reserved region would wrap.
-    fn publish_padding(&self, start: u64, pad: u32) {
-        let end = start.wrapping_add(pad as u64);
-        let mut spin = 0u32;
-        loop {
-            let p = self.publish.load(Ordering::Acquire);
-            if p == start {
-                if self
-                    .publish
-                    .compare_exchange_weak(p, end, Ordering::Release, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                spin = spin.wrapping_add(1);
-                if spin < 50 {
-                    spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
+    /// Consumer: attempt to acquire the next ready chunk.
+    pub fn consumer_acquire(&mut self) -> Option<ConsumerChunk<'_>> {
+        let c = self.chunk(self.cons);
+        // Acquire pairs with producer's publish Release.
+        if c.hdr().state.load(Ordering::Acquire) != STATE_READY {
+            return None;
         }
+        // Transition to READING so producer won't reuse until consumer releases.
+        c.hdr().state.store(STATE_READING, Ordering::Relaxed);
+        Some(ConsumerChunk { ring: self, idx: self.cons })
+    }
+}
+
+pub struct ProducerChunk<'a> {
+    ring: &'a mut ChunkRing,
+    idx: usize,
+}
+
+impl<'a> ProducerChunk<'a> {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let c = self.ring.chunk(self.idx);
+        unsafe { core::slice::from_raw_parts_mut(c.data.as_ptr(), c.cap) }
     }
 
-    /// Attempt to read the next published chunk (single consumer).
-    pub fn try_read(&self) -> Result<ReadChunk<'_>, RingError> {
-        // Best-effort single-consumer detection.
-        if self
-            .consumer_entered
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // Another consumer active; treat as empty to avoid UB.
-            return Err(RingError::Empty);
-        }
-
-        let res = self.try_read_inner();
-        self.consumer_entered.store(0, Ordering::Release);
-        res
+    /// Publish written bytes.
+    pub fn commit(self, len: usize) {
+        let c = self.ring.chunk(self.idx);
+        assert!(len <= c.cap);
+        // Write len before publish.
+        c.hdr_mut().len = len as u32;
+        // Publish with Release so consumer Acquire sees payload and len.
+        c.hdr().state.store(STATE_READY, Ordering::Release);
+        self.ring.prod = self.ring.prod.wrapping_add(1);
     }
 
-    fn try_read_inner(&self) -> Result<ReadChunk<'_>, RingError> {
-        let c = self.consume.load(Ordering::Relaxed);
-        let p = self.publish.load(Ordering::Acquire);
-        if c == p {
-            return Err(RingError::Empty);
-        }
+    /// Abort without publishing.
+    pub fn abort(self) {
+        let c = self.ring.chunk(self.idx);
+        c.hdr_mut().len = 0;
+        c.hdr().state.store(STATE_EMPTY, Ordering::Release);
+    }
+}
 
-        let start = align_up(c as usize, CHUNK_ALIGN) as u64;
-        if start != c {
-            // Consumer must follow same alignment rule; skip alignment padding.
-            self.consume.store(start, Ordering::Release);
-            self.consume_cached.store(start, Ordering::Relaxed);
-        }
+pub struct ConsumerChunk<'a> {
+    ring: &'a mut ChunkRing,
+    idx: usize,
+}
 
-        let idx = (start & self.mask) as usize;
-        if idx + Self::hdr_size() > self.cap as usize {
-            // Not enough space for header at end; wrap.
-            let next = (start + (self.cap - (idx as u64))) as u64;
-            self.consume.store(next, Ordering::Release);
-            self.consume_cached.store(next, Ordering::Relaxed);
-            return Err(RingError::Empty);
-        }
-
-        // Read header.
-        let (len, state) = unsafe {
-            let p = self.buf_ptr().add(idx) as *const ChunkHdr;
-            ((*p).len, (*p).state)
-        };
-
-        if state != STATE_PUBLISHED {
-            // Producer hasn't published yet.
-            return Err(RingError::Empty);
-        }
-
-        let total = align_up(Self::hdr_size() + (len as usize), CHUNK_ALIGN) as u32;
-
-        // Padding chunk (len=0) used to wrap: consume it immediately.
-        if len == 0 {
-            self.consume_chunk(start, total);
-            return Err(RingError::Empty);
-        }
-
-        if idx + (total as usize) > self.cap as usize {
-            // Corrupt / partial wrap. Treat as empty.
-            return Err(RingError::Empty);
-        }
-
-        let payload_ptr = unsafe { self.buf_ptr().add(idx + Self::hdr_size()) as *const u8 };
-        Ok(ReadChunk {
-            ring: self,
-            start,
-            total,
-            len,
-            payload_ptr,
-        })
+impl<'a> ConsumerChunk<'a> {
+    pub fn as_slice(&self) -> &[u8] {
+        let c = self.ring.chunk(self.idx);
+        // len is synchronized by acquire of READY.
+        let len = c.hdr().len as usize;
+        unsafe { core::slice::from_raw_parts(c.data.as_ptr(), len) }
     }
 
-    fn consume_chunk(&self, start: u64, total: u32) {
-        let end = start.wrapping_add(total as u64);
-        // Advance consume cursor.
-        self.consume.store(end, Ordering::Release);
-        self.consume_cached.store(end, Ordering::Relaxed);
-
-        // Mark header free (optional; not required for correctness since we use cursors).
-        self.write_hdr(start, 0, STATE_FREE);
-    }
-
-    /// Convenience: read the next chunk and copy into `dst`.
-    ///
-    /// Returns `Ok(n)` bytes copied and consumed; `Empty` if none; `InvalidSize` if dst too small.
-    pub fn try_read_into(&self, dst: &mut [u8]) -> Result<usize, RingError> {
-        match self.try_read() {
-            Ok(chunk) => {
-                let n = chunk.len as usize;
-                if dst.len() < n {
-                    return Err(RingError::InvalidSize);
-                }
-                // Copy then consume.
-                unsafe {
-                    ptr::copy_nonoverlapping(chunk.payload_ptr, dst.as_mut_ptr(), n);
-                }
-                chunk.consume();
-                Ok(n)
-            }
-            Err(e) => Err(e),
-        }
+    pub fn release(self) {
+        let c = self.ring.chunk(self.idx);
+        // Reset len then mark empty with Release so producer Acquire observes.
+        c.hdr_mut().len = 0;
+        c.hdr().state.store(STATE_EMPTY, Ordering::Release);
+        self.ring.cons = self.ring.cons.wrapping_add(1);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::thread;
 
     #[test]
-    fn capacity_must_be_power_of_two() {
-        assert_eq!(ChunkRing::new(0).err(), Some(RingError::InvalidCapacity));
-        assert_eq!(ChunkRing::new(3).err(), Some(RingError::InvalidCapacity));
-        assert!(ChunkRing::new(64).is_ok());
-        assert!(ChunkRing::new(128).is_ok());
+    fn spsc_basic_roundtrip() {
+        let mut r = ChunkRing::new(8, 64);
+
+        // Producer reserve/commit
+        let mut p = r.producer_reserve().expect("reserve");
+        p.as_mut_slice()[..5].copy_from_slice(b"hello");
+        p.commit(5);
+
+        // Consumer acquire/read/release
+        let c = r.consumer_acquire().expect("acquire");
+        assert_eq!(c.as_slice(), b"hello");
+        c.release();
+
+        // Now producer can reuse.
+        assert!(r.producer_reserve().is_some());
     }
 
     #[test]
-    fn single_thread_roundtrip() {
-        let ring = ChunkRing::new(256).unwrap();
-        let mut w = ring.try_reserve(5).unwrap();
-        w.as_mut().copy_from_slice(b"hello");
-        w.publish();
+    fn ring_full_returns_none_no_panic() {
+        let mut r = ChunkRing::new(2, 8);
 
-        let r = ring.try_read().unwrap();
-        assert_eq!(r.as_bytes(), b"hello");
-        r.consume();
-        assert_eq!(ring.try_read().err(), Some(RingError::Empty));
+        // Fill both chunks
+        for _ in 0..2 {
+            let mut p = r.producer_reserve().unwrap();
+            p.as_mut_slice()[0] = 1;
+            p.commit(1);
+        }
+
+        // No space
+        assert!(r.producer_reserve().is_none());
+
+        // Drain one
+        let c = r.consumer_acquire().unwrap();
+        assert_eq!(c.as_slice(), &[1]);
+        c.release();
+
+        // Space now available
+        assert!(r.producer_reserve().is_some());
     }
 
     #[test]
-    fn mpsc_smoke() {
-        let ring = Arc::new(ChunkRing::new(1 << 12).unwrap());
-        let producers = 4;
-        let per = 2000;
+    fn consumer_empty_returns_none_no_panic() {
+        let mut r = ChunkRing::new(4, 16);
+        assert!(r.consumer_acquire().is_none());
 
-        let mut ths = Vec::new();
-        for p in 0..producers {
-            let r = ring.clone();
-            ths.push(thread::spawn(move || {
-                for i in 0..per {
-                    let msg = (p as u32, i as u32);
-                    let mut buf = [0u8; 8];
-                    buf[..4].copy_from_slice(&msg.0.to_le_bytes());
-                    buf[4..].copy_from_slice(&msg.1.to_le_bytes());
+        let mut p = r.producer_reserve().unwrap();
+        p.as_mut_slice()[0] = 7;
+        p.commit(1);
 
-                    loop {
-                        match r.try_reserve(8) {
-                            Ok(mut w) => {
-                                w.as_mut().copy_from_slice(&buf);
-                                w.publish();
-                                break;
-                            }
-                            Err(RingError::Full) => {
-                                std::thread::yield_now();
-                            }
-                            Err(e) => panic!("unexpected: {e:?}"),
-                        }
-                    }
-                }
-            }));
-        }
+        let c = r.consumer_acquire().unwrap();
+        assert_eq!(c.as_slice(), &[7]);
+        c.release();
 
-        let total = producers * per;
-        let mut got = 0;
-        let mut dst = [0u8; 8];
-        while got < total {
-            match ring.try_read_into(&mut dst) {
-                Ok(8) => {
-                    got += 1;
-                }
-                Err(RingError::Empty) => {
-                    std::thread::yield_now();
-                }
-                Err(e) => panic!("unexpected: {e:?}"),
-                Ok(n) => panic!("unexpected n={n}"),
-            }
-        }
-
-        for t in ths {
-            t.join().unwrap();
-        }
+        assert!(r.consumer_acquire().is_none());
     }
 }
