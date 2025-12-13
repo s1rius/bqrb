@@ -1,0 +1,23 @@
+[package]
+name = "bqrb"
+version = "0.1.0"
+edition = "2021"
+authors = ["bqrb contributors"]
+license = "MIT OR Apache-2.0"
+description = "A pure Rust ring buffer implementation inspired by Tencent/BqLog"
+repository = "https://github.com/s1rius/bqrb"
+readme = "README.md"
+keywords = ["ring-buffer", "lock-free", "concurrent"]
+categories = ["data-structures", "concurrency"]
+
+[lib]
+name = "bqrb"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[[bench]]
+name = "throughput"
+harness = false
