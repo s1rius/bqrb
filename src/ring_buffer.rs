@@ -320,6 +320,8 @@ impl RingBuffer {
             ) {
                 Ok(_) => {
                     // Successfully allocated
+                    // The successful CAS above (with AcqRel ordering) already ensures that
+                    // the new write_cursor value is visible to readers.
                     unsafe {
                         // If wrapping, write skip marker at the old write_pos
                         if needs_skip_marker {
@@ -327,8 +329,6 @@ impl RingBuffer {
                             std::ptr::write(skip_length_ptr, SKIP_MARKER);
                             let skip_state_ptr = self.inner.data.add(write_pos as usize + 4);
                             std::ptr::write(skip_state_ptr, ChunkState::Committed as u8);
-                            // Release fence ensures skip marker is visible before write_cursor update
-                            std::sync::atomic::fence(Ordering::Release);
                         }
                         
                         // Write the actual chunk header at alloc_offset
@@ -338,12 +338,12 @@ impl RingBuffer {
 
                         // Write state as Reserved
                         // This doesn't need to be atomic since only this producer writes to this chunk
-                        // until commit, and the write_cursor update above synchronizes with readers
+                        // until commit, and the write_cursor CAS above synchronizes with readers
                         let state_ptr = self.inner.data.add(alloc_offset as usize + 4);
                         std::ptr::write(state_ptr, ChunkState::Reserved as u8);
                         
-                        // Release fence ensures header writes are visible to other threads
-                        // before they can observe this allocation via write_cursor
+                        // Release fence ensures skip marker (if any) and header writes are visible
+                        // to readers that observe the updated write_cursor
                         std::sync::atomic::fence(Ordering::Release);
                     }
 
@@ -409,67 +409,69 @@ impl RingBuffer {
     /// * `Ok(ReadHandle)` with the chunk data
     /// * `Err(ResultCode::EmptyRingBuffer)` if no data is available
     pub fn read(&self) -> Result<ReadHandle, ResultCode> {
-        let private_read_pos = self.inner.private_read_cursor.load(Ordering::Acquire);
-        let write_pos = self.inner.write_cursor.load(Ordering::Acquire);
+        // Loop to handle skip markers without recursion
+        loop {
+            let private_read_pos = self.inner.private_read_cursor.load(Ordering::Acquire);
+            let write_pos = self.inner.write_cursor.load(Ordering::Acquire);
 
-        // Check if buffer is empty
-        if private_read_pos == write_pos {
-            return Err(ResultCode::EmptyRingBuffer);
-        }
+            // Check if buffer is empty
+            if private_read_pos == write_pos {
+                return Err(ResultCode::EmptyRingBuffer);
+            }
 
-        // Read chunk header with proper memory ordering
-        // Acquire fence synchronizes with the Release fence in alloc_write_chunk and commit_write_chunk
-        // This ensures we see all writes to the header and payload
-        let (length, state) = unsafe {
-            // Acquire fence pairs with Release fence in writer
-            std::sync::atomic::fence(Ordering::Acquire);
+            // Read chunk header with proper memory ordering
+            // Acquire fence synchronizes with the Release fence in alloc_write_chunk and commit_write_chunk
+            // This ensures we see all writes to the header and payload
+            let (length, state) = unsafe {
+                // Acquire fence pairs with Release fence in writer
+                std::sync::atomic::fence(Ordering::Acquire);
+                
+                let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
+                let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
+                
+                let length = std::ptr::read(length_ptr);
+                // read_volatile ensures we always read the latest state
+                let state = std::ptr::read_volatile(state_ptr);
+                (length, state)
+            };
+
+            // Check if chunk is committed
+            if state != ChunkState::Committed as u8 {
+                // Not yet committed by producer
+                return Err(ResultCode::EmptyRingBuffer);
+            }
+
+            // Check for skip marker
+            if length == SKIP_MARKER {
+                // This is a skip marker, wrap to the beginning and continue reading
+                self.inner.private_read_cursor.store(0, Ordering::Release);
+                continue;
+            }
+
+            // Validate length
+            if length == 0 || length > MAX_PAYLOAD_SIZE {
+                return Err(ResultCode::EmptyRingBuffer);
+            }
+
+            // Calculate total chunk size
+            let total_size = (length + CHUNK_HEADER_SIZE + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
+
+            // Advance private read cursor with proper wrap-around check
+            let new_private_read_pos = if private_read_pos + total_size >= self.inner.capacity {
+                // Wrap around to beginning
+                0
+            } else {
+                private_read_pos + total_size
+            };
             
-            let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
-            let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
-            
-            let length = std::ptr::read(length_ptr);
-            // read_volatile ensures we always read the latest state
-            let state = std::ptr::read_volatile(state_ptr);
-            (length, state)
-        };
+            self.inner.private_read_cursor.store(new_private_read_pos, Ordering::Release);
 
-        // Check if chunk is committed
-        if state != ChunkState::Committed as u8 {
-            // Not yet committed by producer
-            return Err(ResultCode::EmptyRingBuffer);
+            return Ok(ReadHandle {
+                buffer: Arc::clone(&self.inner),
+                offset: private_read_pos,
+                length,
+            });
         }
-
-        // Check for skip marker
-        if length == SKIP_MARKER {
-            // This is a skip marker, wrap to the beginning
-            self.inner.private_read_cursor.store(0, Ordering::Release);
-            // Recursively read the next chunk at position 0
-            return self.read();
-        }
-
-        // Validate length
-        if length == 0 || length > MAX_PAYLOAD_SIZE {
-            return Err(ResultCode::EmptyRingBuffer);
-        }
-
-        // Calculate total chunk size
-        let total_size = (length + CHUNK_HEADER_SIZE + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
-
-        // Advance private read cursor with proper wrap-around check
-        let new_private_read_pos = if private_read_pos + total_size >= self.inner.capacity {
-            // Wrap around to beginning
-            0
-        } else {
-            private_read_pos + total_size
-        };
-        
-        self.inner.private_read_cursor.store(new_private_read_pos, Ordering::Release);
-
-        Ok(ReadHandle {
-            buffer: Arc::clone(&self.inner),
-            offset: private_read_pos,
-            length,
-        })
     }
 
     /// End the read session and publish the private read cursor
