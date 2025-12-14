@@ -1,33 +1,34 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 // # Memory Ordering Strategy
 //
-// This ring buffer uses a combination of atomic operations and memory fences for synchronization:
+// This ring buffer uses atomic operations for synchronization:
 //
 // ## Cursors (write_cursor, read_cursor, private_read_cursor)
 // - Use AtomicU32 with Acquire/Release ordering
 // - Provide synchronization points for visibility of buffer modifications
 //
-// ## Chunk Headers (length + state fields)
-// - Writers use std::ptr::write + Release fence
-// - Readers use Acquire fence + std::ptr::read/read_volatile
-// - The Release fence in alloc_write_chunk ensures header writes happen-before cursor update
-// - The Release fence in commit_write_chunk ensures payload writes happen-before state change
-// - The Acquire fence in read() ensures visibility of all prior writes
+// ## Chunk Headers (ChunkHeader with atomic fields)
+// - length field: AtomicU32 with Relaxed ordering
+// - state field: AtomicU8 with Release (write) and Acquire (read) ordering
+// - Writers use atomic stores with Release ordering on state
+// - Readers use atomic loads with Acquire ordering on state
 //
-// ## Why not AtomicU32 for chunk headers?
-// - The current fence-based approach is simpler and more flexible
-// - Headers are written by a single producer (after CAS on write_cursor)
-// - The state field uses write_volatile to prevent compiler elision
-// - Fences provide sufficient ordering guarantees at synchronization points
+// ## Memory Ordering Rationale
+// - state field uses Release on write and Acquire on read
+//   This synchronizes the visibility of the length field and payload data
+// - length field can use Relaxed because its visibility is synchronized
+//   through the state field's Acquire/Release semantics
+// - This follows the "synchronizes-with" relationship pattern
+// - No separate fences needed; atomic operations provide sufficient ordering
 //
 // ## Correctness Argument
 // 1. Producer claims space via compare_exchange (AcqRel) on write_cursor
-// 2. Producer writes header + Release fence → header visible
-// 3. Producer writes payload + commit with Release fence → payload visible
+// 2. Producer writes header with atomic stores (length Relaxed, state Release)
+// 3. Producer writes payload + commits with atomic store (state Release)
 // 4. Consumer loads write_cursor (Acquire) → sees cursor update
-// 5. Consumer Acquire fence + read header/state → sees header + payload
+// 5. Consumer loads state (Acquire) → sees header + payload
 //
 // The ordering ensures that when a consumer reads a Committed chunk,
 // all writes to that chunk (header + payload) are visible.
@@ -70,6 +71,27 @@ enum ChunkState {
     /// Chunk has been committed and is ready to read
     Committed = 1,
 }
+
+/// Chunk header with atomic fields for thread-safe access
+#[repr(C)]
+struct ChunkHeader {
+    length: AtomicU32,
+    state: AtomicU8,
+    _padding: [u8; 3],  // Maintain 8-byte header size
+}
+
+// Compile-time assertions to ensure alignment safety for atomic operations
+const _: () = {
+    use std::mem::{align_of, size_of};
+    
+    // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
+    // ChunkHeader requires 4-byte alignment (from AtomicU32)
+    // BLOCK_SIZE (64) is a multiple of 4, so all chunk offsets are properly aligned
+    assert!((BLOCK_SIZE as usize).is_multiple_of(align_of::<AtomicU32>()));
+    
+    // Verify ChunkHeader size matches CHUNK_HEADER_SIZE
+    assert!(size_of::<ChunkHeader>() == CHUNK_HEADER_SIZE as usize);
+};
 
 /// Handle for writing data to an allocated chunk
 #[derive(Debug)]
@@ -325,26 +347,19 @@ impl RingBuffer {
                     unsafe {
                         // If wrapping, write skip marker at the old write_pos
                         if needs_skip_marker {
-                            let skip_length_ptr = self.inner.data.add(write_pos as usize) as *mut u32;
-                            std::ptr::write(skip_length_ptr, SKIP_MARKER);
-                            let skip_state_ptr = self.inner.data.add(write_pos as usize + 4);
-                            std::ptr::write(skip_state_ptr, ChunkState::Committed as u8);
+                            // SAFETY: write_pos is always a multiple of BLOCK_SIZE (64 bytes),
+                            // which is greater than ChunkHeader's alignment requirement (4 bytes)
+                            let skip_header = &*(self.inner.data.add(write_pos as usize) as *const ChunkHeader);
+                            skip_header.length.store(SKIP_MARKER, Ordering::Relaxed);
+                            skip_header.state.store(ChunkState::Committed as u8, Ordering::Release);
                         }
                         
                         // Write the actual chunk header at alloc_offset
-                        // Memory ordering: length must be written before state changes to Committed
-                        let length_ptr = self.inner.data.add(alloc_offset as usize) as *mut u32;
-                        std::ptr::write(length_ptr, size);
-
-                        // Write state as Reserved
-                        // This doesn't need to be atomic since only this producer writes to this chunk
-                        // until commit, and the write_cursor CAS above synchronizes with readers
-                        let state_ptr = self.inner.data.add(alloc_offset as usize + 4);
-                        std::ptr::write(state_ptr, ChunkState::Reserved as u8);
-                        
-                        // Release fence ensures skip marker (if any) and header writes are visible
-                        // to readers that observe the updated write_cursor
-                        std::sync::atomic::fence(Ordering::Release);
+                        // SAFETY: alloc_offset is always a multiple of BLOCK_SIZE (64 bytes),
+                        // which is greater than ChunkHeader's alignment requirement (4 bytes)
+                        let header = &*(self.inner.data.add(alloc_offset as usize) as *const ChunkHeader);
+                        header.length.store(size, Ordering::Relaxed);
+                        header.state.store(ChunkState::Reserved as u8, Ordering::Release);
                     }
 
                     // Calculate approximate used blocks
@@ -376,17 +391,15 @@ impl RingBuffer {
     /// * `handle` - The write handle from `alloc_write_chunk`
     ///
     /// # Memory Ordering
-    /// Uses write_volatile + Release fence to ensure:
+    /// Uses atomic store with Release ordering to ensure:
     /// - All payload writes happen-before the state change to Committed
-    /// - Readers with Acquire fence will see payload data when they see Committed state
+    /// - Readers with Acquire ordering will see payload data when they see Committed state
     pub fn commit_write_chunk(&self, handle: WriteHandle) {
         unsafe {
-            let state_ptr = handle.buffer.data.add(handle.offset as usize + 4);
-            // write_volatile ensures the write is not elided by the compiler
-            std::ptr::write_volatile(state_ptr, ChunkState::Committed as u8);
-            // Release fence ensures all prior writes (header + payload) are visible
-            // to any reader that observes the Committed state via Acquire fence
-            std::sync::atomic::fence(Ordering::Release);
+            // SAFETY: handle.offset is always a multiple of BLOCK_SIZE (64 bytes),
+            // which is greater than ChunkHeader's alignment requirement (4 bytes)
+            let header = &*(handle.buffer.data.add(handle.offset as usize) as *const ChunkHeader);
+            header.state.store(ChunkState::Committed as u8, Ordering::Release);
         }
     }
 
@@ -420,18 +433,14 @@ impl RingBuffer {
             }
 
             // Read chunk header with proper memory ordering
-            // Acquire fence synchronizes with the Release fence in alloc_write_chunk and commit_write_chunk
+            // Acquire ordering on state load synchronizes with Release ordering in writer
             // This ensures we see all writes to the header and payload
             let (length, state) = unsafe {
-                // Acquire fence pairs with Release fence in writer
-                std::sync::atomic::fence(Ordering::Acquire);
-                
-                let length_ptr = self.inner.data.add(private_read_pos as usize) as *const u32;
-                let state_ptr = self.inner.data.add(private_read_pos as usize + 4) as *const u8;
-                
-                let length = std::ptr::read(length_ptr);
-                // read_volatile ensures we always read the latest state
-                let state = std::ptr::read_volatile(state_ptr);
+                // SAFETY: private_read_pos is always a multiple of BLOCK_SIZE (64 bytes),
+                // which is greater than ChunkHeader's alignment requirement (4 bytes)
+                let header = &*(self.inner.data.add(private_read_pos as usize) as *const ChunkHeader);
+                let state = header.state.load(Ordering::Acquire);
+                let length = header.length.load(Ordering::Relaxed);
                 (length, state)
             };
 
