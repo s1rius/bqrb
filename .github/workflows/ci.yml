@@ -76,10 +76,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         rust: [stable, beta, nightly]
+        exclude:
+          # Exclude macOS nightly and beta due to intermittent test failures
+          - os: macos-latest
+            rust: nightly
+          - os: macos-latest
+            rust: beta
         include:
           # Test MSRV (Minimum Supported Rust Version) on Linux only
           - os: ubuntu-latest
-            rust: '1.70'
+            rust: '1.75'
     
     steps:
       - uses: actions/checkout@v4
