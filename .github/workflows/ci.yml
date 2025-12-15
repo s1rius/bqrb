@@ -192,6 +192,95 @@ jobs:
       - name: Test with no default features
         run: cargo test --no-default-features --verbose
 
+  # Android cross-compilation
+  android:
+    name: Android ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+          - i686-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: ${{ runner.os }}-android-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-cargo-registry-
+      
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git/db/
+          key: ${{ runner.os }}-android-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-cargo-git-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: ${{ runner.os }}-android-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-${{ matrix.target }}-cargo-build-
+      
+      - name: Build for Android
+        run: cargo build --target ${{ matrix.target }} --verbose
+
+  # iOS cross-compilation
+  ios:
+    name: iOS ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - x86_64-apple-ios
+          - aarch64-apple-ios-sim
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: ${{ runner.os }}-ios-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-cargo-registry-
+      
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git/db/
+          key: ${{ runner.os }}-ios-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-cargo-git-
+      
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: ${{ runner.os }}-ios-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-${{ matrix.target }}-cargo-build-
+      
+      - name: Build for iOS
+        run: cargo build --target ${{ matrix.target }} --verbose
+
   # Check for security vulnerabilities
   security-audit:
     name: Security audit
@@ -217,6 +306,8 @@ jobs:
       - test
       - docs
       - feature-tests
+      - android
+      - ios
       - security-audit
     runs-on: ubuntu-latest
     steps:
@@ -227,6 +318,8 @@ jobs:
                 "${{ needs.test.result }}" != "success" || \
                 "${{ needs.docs.result }}" != "success" || \
                 "${{ needs.feature-tests.result }}" != "success" || \
+                "${{ needs.android.result }}" != "success" || \
+                "${{ needs.ios.result }}" != "success" || \
                 "${{ needs.security-audit.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
