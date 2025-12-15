@@ -81,13 +81,14 @@ struct ChunkHeader {
 }
 
 // Compile-time assertions to ensure alignment safety for atomic operations
+#[allow(clippy::manual_is_multiple_of)] // MSRV 1.75 compatibility
 const _: () = {
     use std::mem::{align_of, size_of};
 
     // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
     // ChunkHeader requires 4-byte alignment (from AtomicU32)
     // BLOCK_SIZE (64) is a multiple of 4, so all chunk offsets are properly aligned
-    assert!((BLOCK_SIZE as usize).is_multiple_of(align_of::<AtomicU32>()));
+    assert!((BLOCK_SIZE as usize) % align_of::<AtomicU32>() == 0);
 
     // Verify ChunkHeader size matches CHUNK_HEADER_SIZE
     assert!(size_of::<ChunkHeader>() == CHUNK_HEADER_SIZE as usize);
@@ -370,7 +371,8 @@ impl RingBuffer {
                     } else {
                         self.inner.capacity - read_pos + new_write_pos
                     };
-                    let approximate_used_blocks = used_after.div_ceil(BLOCK_SIZE);
+                    #[allow(clippy::manual_div_ceil)] // MSRV 1.75 compatibility
+                    let approximate_used_blocks = (used_after + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
                     return Ok(WriteHandle {
                         buffer: Arc::clone(&self.inner),
