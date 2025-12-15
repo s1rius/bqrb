@@ -87,7 +87,7 @@ const _: () = {
     // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
     // ChunkHeader requires 4-byte alignment (from AtomicU32)
     // BLOCK_SIZE (64) is a multiple of 4, so all chunk offsets are properly aligned
-    assert!((BLOCK_SIZE as usize) % align_of::<AtomicU32>() == 0);
+    assert!((BLOCK_SIZE as usize).is_multiple_of(align_of::<AtomicU32>()));
 
     // Verify ChunkHeader size matches CHUNK_HEADER_SIZE
     assert!(size_of::<ChunkHeader>() == CHUNK_HEADER_SIZE as usize);
@@ -370,7 +370,7 @@ impl RingBuffer {
                     } else {
                         self.inner.capacity - read_pos + new_write_pos
                     };
-                    let approximate_used_blocks = (used_after + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                    let approximate_used_blocks = used_after.div_ceil(BLOCK_SIZE);
 
                     return Ok(WriteHandle {
                         buffer: Arc::clone(&self.inner),
