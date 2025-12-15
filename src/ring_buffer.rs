@@ -77,18 +77,18 @@ enum ChunkState {
 struct ChunkHeader {
     length: AtomicU32,
     state: AtomicU8,
-    _padding: [u8; 3],  // Maintain 8-byte header size
+    _padding: [u8; 3], // Maintain 8-byte header size
 }
 
 // Compile-time assertions to ensure alignment safety for atomic operations
 const _: () = {
     use std::mem::{align_of, size_of};
-    
+
     // Verify that BLOCK_SIZE provides sufficient alignment for ChunkHeader
     // ChunkHeader requires 4-byte alignment (from AtomicU32)
     // BLOCK_SIZE (64) is a multiple of 4, so all chunk offsets are properly aligned
     assert!((BLOCK_SIZE as usize).is_multiple_of(align_of::<AtomicU32>()));
-    
+
     // Verify ChunkHeader size matches CHUNK_HEADER_SIZE
     assert!(size_of::<ChunkHeader>() == CHUNK_HEADER_SIZE as usize);
 };
@@ -117,7 +117,7 @@ impl WriteHandle {
 
         let payload_offset = self.offset + CHUNK_HEADER_SIZE;
         let write_pos = payload_offset as usize;
-        
+
         // Safety: offset is validated during allocation
         unsafe {
             let dst = self.buffer.data.add(write_pos);
@@ -145,11 +145,9 @@ impl ReadHandle {
     pub fn data(&self) -> &[u8] {
         let payload_offset = self.offset + CHUNK_HEADER_SIZE;
         let start = payload_offset as usize;
-        
+
         // Safety: offset and length are validated during read
-        unsafe {
-            std::slice::from_raw_parts(self.buffer.data.add(start), self.length as usize)
-        }
+        unsafe { std::slice::from_raw_parts(self.buffer.data.add(start), self.length as usize) }
     }
 
     /// Get the length of the data in this chunk
@@ -241,14 +239,12 @@ impl RingBuffer {
         }
 
         let capacity = num_blocks * BLOCK_SIZE;
-        
+
         // Allocate aligned buffer
         let data = unsafe {
-            let layout = std::alloc::Layout::from_size_align(
-                capacity as usize,
-                BLOCK_SIZE as usize,
-            )
-            .map_err(|_| ResultCode::BufferNotInited)?;
+            let layout =
+                std::alloc::Layout::from_size_align(capacity as usize, BLOCK_SIZE as usize)
+                    .map_err(|_| ResultCode::BufferNotInited)?;
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 return Err(ResultCode::BufferNotInited);
@@ -320,7 +316,7 @@ impl RingBuffer {
             let mut alloc_offset = write_pos;
             let space_at_end = self.inner.capacity - write_pos;
             let needs_skip_marker = space_at_end < total_size;
-            
+
             let new_write_pos = if needs_skip_marker {
                 // Need to wrap around
                 // Check if we have space at the beginning
@@ -349,17 +345,23 @@ impl RingBuffer {
                         if needs_skip_marker {
                             // SAFETY: write_pos is always a multiple of BLOCK_SIZE (64 bytes),
                             // which is greater than ChunkHeader's alignment requirement (4 bytes)
-                            let skip_header = &*(self.inner.data.add(write_pos as usize) as *const ChunkHeader);
+                            let skip_header =
+                                &*(self.inner.data.add(write_pos as usize) as *const ChunkHeader);
                             skip_header.length.store(SKIP_MARKER, Ordering::Relaxed);
-                            skip_header.state.store(ChunkState::Committed as u8, Ordering::Release);
+                            skip_header
+                                .state
+                                .store(ChunkState::Committed as u8, Ordering::Release);
                         }
-                        
+
                         // Write the actual chunk header at alloc_offset
                         // SAFETY: alloc_offset is always a multiple of BLOCK_SIZE (64 bytes),
                         // which is greater than ChunkHeader's alignment requirement (4 bytes)
-                        let header = &*(self.inner.data.add(alloc_offset as usize) as *const ChunkHeader);
+                        let header =
+                            &*(self.inner.data.add(alloc_offset as usize) as *const ChunkHeader);
                         header.length.store(size, Ordering::Relaxed);
-                        header.state.store(ChunkState::Reserved as u8, Ordering::Release);
+                        header
+                            .state
+                            .store(ChunkState::Reserved as u8, Ordering::Release);
                     }
 
                     // Calculate approximate used blocks
@@ -399,7 +401,9 @@ impl RingBuffer {
             // SAFETY: handle.offset is always a multiple of BLOCK_SIZE (64 bytes),
             // which is greater than ChunkHeader's alignment requirement (4 bytes)
             let header = &*(handle.buffer.data.add(handle.offset as usize) as *const ChunkHeader);
-            header.state.store(ChunkState::Committed as u8, Ordering::Release);
+            header
+                .state
+                .store(ChunkState::Committed as u8, Ordering::Release);
         }
     }
 
@@ -410,7 +414,9 @@ impl RingBuffer {
     pub fn begin_read(&self) {
         // Initialize private cursor from public cursor
         let read_pos = self.inner.read_cursor.load(Ordering::Acquire);
-        self.inner.private_read_cursor.store(read_pos, Ordering::Release);
+        self.inner
+            .private_read_cursor
+            .store(read_pos, Ordering::Release);
     }
 
     /// Read the next chunk from the ring buffer
@@ -438,7 +444,8 @@ impl RingBuffer {
             let (length, state) = unsafe {
                 // SAFETY: private_read_pos is always a multiple of BLOCK_SIZE (64 bytes),
                 // which is greater than ChunkHeader's alignment requirement (4 bytes)
-                let header = &*(self.inner.data.add(private_read_pos as usize) as *const ChunkHeader);
+                let header =
+                    &*(self.inner.data.add(private_read_pos as usize) as *const ChunkHeader);
                 let state = header.state.load(Ordering::Acquire);
                 let length = header.length.load(Ordering::Relaxed);
                 (length, state)
@@ -472,8 +479,10 @@ impl RingBuffer {
             } else {
                 private_read_pos + total_size
             };
-            
-            self.inner.private_read_cursor.store(new_private_read_pos, Ordering::Release);
+
+            self.inner
+                .private_read_cursor
+                .store(new_private_read_pos, Ordering::Release);
 
             return Ok(ReadHandle {
                 buffer: Arc::clone(&self.inner),
@@ -489,7 +498,9 @@ impl RingBuffer {
     pub fn end_read(&self) {
         // Publish private cursor to public cursor
         let private_read_pos = self.inner.private_read_cursor.load(Ordering::Acquire);
-        self.inner.read_cursor.store(private_read_pos, Ordering::Release);
+        self.inner
+            .read_cursor
+            .store(private_read_pos, Ordering::Release);
     }
 
     /// Get the capacity in bytes
@@ -524,11 +535,11 @@ mod tests {
     #[test]
     fn test_alloc_size_invalid() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         // Zero size
         let result = rb.alloc_write_chunk(0);
         assert_eq!(result.unwrap_err(), ResultCode::AllocSizeInvalid);
-        
+
         // Too large
         let result = rb.alloc_write_chunk(MAX_PAYLOAD_SIZE + 1);
         assert_eq!(result.unwrap_err(), ResultCode::AllocSizeInvalid);
@@ -537,20 +548,20 @@ mod tests {
     #[test]
     fn test_single_threaded_roundtrip() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         // Write some data
         let handle = rb.alloc_write_chunk(100).unwrap();
         let data = b"Hello, world!";
         handle.write(data);
         rb.commit_write_chunk(handle);
-        
+
         // Read it back
         rb.begin_read();
         let read_handle = rb.read().unwrap();
         assert_eq!(read_handle.len(), 100);
         assert_eq!(&read_handle.data()[..data.len()], data);
         rb.end_read();
-        
+
         // Buffer should be empty now
         rb.begin_read();
         let result = rb.read();
@@ -561,7 +572,7 @@ mod tests {
     #[test]
     fn test_empty_ring_buffer() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         rb.begin_read();
         let result = rb.read();
         assert_eq!(result.unwrap_err(), ResultCode::EmptyRingBuffer);
@@ -572,26 +583,26 @@ mod tests {
     fn test_not_enough_space() {
         // Create a small buffer and fill it
         let rb = RingBuffer::new(4).unwrap(); // 256 bytes
-        
+
         // Allocate and commit first chunk (takes 128 bytes)
         let h1 = rb.alloc_write_chunk(100).unwrap();
         h1.write(b"data");
         rb.commit_write_chunk(h1);
-        
+
         // Allocate and commit second chunk (takes another 128 bytes, now full)
         let h2 = rb.alloc_write_chunk(100).unwrap();
         h2.write(b"data");
         rb.commit_write_chunk(h2);
-        
+
         // Try to allocate more - should fail with not enough space
         let result = rb.alloc_write_chunk(50);
         assert_eq!(result.unwrap_err(), ResultCode::NotEnoughSpace);
-        
+
         // Now read one chunk to free space
         rb.begin_read();
         let _ = rb.read().unwrap();
         rb.end_read();
-        
+
         // Should succeed now
         let h3 = rb.alloc_write_chunk(50).unwrap();
         rb.commit_write_chunk(h3);
@@ -600,29 +611,29 @@ mod tests {
     #[test]
     fn test_batching_semantics() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         // Write two chunks
         let h1 = rb.alloc_write_chunk(50).unwrap();
         h1.write(b"chunk1");
         rb.commit_write_chunk(h1);
-        
+
         let h2 = rb.alloc_write_chunk(50).unwrap();
         h2.write(b"chunk2");
         rb.commit_write_chunk(h2);
-        
+
         // Begin read but don't end it
         rb.begin_read();
         let r1 = rb.read().unwrap();
         assert_eq!(&r1.data()[..6], b"chunk1");
-        
+
         // Space should NOT be released yet
         // This should work because we haven't called end_read yet
         let r2 = rb.read().unwrap();
         assert_eq!(&r2.data()[..6], b"chunk2");
-        
+
         // Now end read to publish cursor
         rb.end_read();
-        
+
         // Now space should be available for new writes
         let h3 = rb.alloc_write_chunk(50).unwrap();
         h3.write(b"chunk3");
@@ -634,7 +645,7 @@ mod tests {
         let rb = Arc::new(RingBuffer::new(64).unwrap());
         let num_producers = 4;
         let chunks_per_producer = 10;
-        
+
         // Spawn producer threads
         let mut handles = vec![];
         for i in 0..num_producers {
@@ -664,11 +675,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         // Consumer: read all chunks
         let mut count = 0;
         let expected_total = num_producers * chunks_per_producer;
-        
+
         while count < expected_total {
             rb.begin_read();
             loop {
@@ -684,27 +695,27 @@ mod tests {
                 }
             }
             rb.end_read();
-            
+
             if count < expected_total {
                 thread::sleep(std::time::Duration::from_micros(100));
             }
         }
-        
+
         // Wait for all producers
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         assert_eq!(count, expected_total);
     }
 
     #[test]
     fn test_approximate_used_blocks_count() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         let handle = rb.alloc_write_chunk(100).unwrap();
         let used_blocks = handle.approximate_used_blocks_count();
-        
+
         // 100 bytes + 8 byte header = 108 bytes
         // Rounded up to 64-byte blocks = 128 bytes = 2 blocks
         assert!(used_blocks >= 2);
@@ -715,47 +726,47 @@ mod tests {
         // Create a small buffer to easily trigger wrap-around
         // 8 blocks = 512 bytes
         let rb = RingBuffer::new(8).unwrap();
-        
+
         // Write a chunk that takes up most of the buffer
         // 300 bytes + 8 header = 308 bytes, rounded to 320 bytes (5 blocks)
         let h1 = rb.alloc_write_chunk(300).unwrap();
         let data1 = b"First chunk that takes most of the buffer";
         h1.write(data1);
         rb.commit_write_chunk(h1);
-        
+
         // Write another chunk that should fit in the remaining space
         // 100 bytes + 8 header = 108 bytes, rounded to 128 bytes (2 blocks)
         let h2 = rb.alloc_write_chunk(100).unwrap();
         let data2 = b"Second chunk";
         h2.write(data2);
         rb.commit_write_chunk(h2);
-        
+
         // Read the first chunk to free space
         rb.begin_read();
         let r1 = rb.read().unwrap();
         assert_eq!(r1.len(), 300);
         assert_eq!(&r1.data()[..data1.len()], data1);
         rb.end_read();
-        
+
         // Now write a chunk that will trigger wrap-around
         // This should wrap to position 0 and write a skip marker
         let h3 = rb.alloc_write_chunk(200).unwrap();
         let data3 = b"Third chunk triggers wrap";
         h3.write(data3);
         rb.commit_write_chunk(h3);
-        
+
         // Read second chunk
         rb.begin_read();
         let r2 = rb.read().unwrap();
         assert_eq!(r2.len(), 100);
         assert_eq!(&r2.data()[..data2.len()], data2);
-        
+
         // Read third chunk - should handle skip marker and wrap around
         let r3 = rb.read().unwrap();
         assert_eq!(r3.len(), 200);
         assert_eq!(&r3.data()[..data3.len()], data3);
         rb.end_read();
-        
+
         // Buffer should be empty now
         rb.begin_read();
         let result = rb.read();
@@ -766,21 +777,21 @@ mod tests {
     #[test]
     fn test_clone() {
         let rb = RingBuffer::new(16).unwrap();
-        
+
         // Clone the ring buffer
         let rb_clone = rb.clone();
-        
+
         // Write via original
         let h1 = rb.alloc_write_chunk(50).unwrap();
         h1.write(b"test data");
         rb.commit_write_chunk(h1);
-        
+
         // Read via clone
         rb_clone.begin_read();
         let r1 = rb_clone.read().unwrap();
         assert_eq!(&r1.data()[..9], b"test data");
         rb_clone.end_read();
-        
+
         // Should be empty now from both
         rb.begin_read();
         let result = rb.read();
